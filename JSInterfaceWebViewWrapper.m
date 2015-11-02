@@ -25,6 +25,9 @@ static NSString * const kJSInterfaceWebViewWrapperNoSchemaErrorMessage = @"[ pub
 static NSInteger const kJSInterfaceWebViewWrapperNullSelectorsErrorCode = 4;
 static NSString * const kJSInterfaceWebViewWrapperNullSelectorsErrorMessage = @"[ publicSelectorsForJSInterfaceWebView:] must return a value different from nil";
 
+#pragma mark - Utility constants
+static NSInteger const kJSInterfaceWebViewWrapperSelectorDelayInMilliseconds = 100;
+
 @interface JSInterfaceWebViewWrapper ()
 {
   UIWebView *_webView;
@@ -48,6 +51,15 @@ static NSString * const kJSInterfaceWebViewWrapperNullSelectorsErrorMessage = @"
   return self;
 }
 
+- (void)dealloc
+{
+  [_webView setDelegate:nil];
+  [_webView release];
+  [receivedCustomSchema release];
+  self.dataSource = nil;
+  [super dealloc];
+}
+
 #pragma mark - Public methods
 
 - (void)loadRequest:(NSURLRequest *)request
@@ -60,6 +72,12 @@ static NSString * const kJSInterfaceWebViewWrapperNullSelectorsErrorMessage = @"
 {
   if (_webView)
     [_webView reload];
+}
+
+- (void)cancelRequest
+{
+  if (_webView.isLoading)
+    [_webView stopLoading];
 }
 
 - (JSInterfaceWebView *)viewForWebView
@@ -117,8 +135,8 @@ static NSString * const kJSInterfaceWebViewWrapperNullSelectorsErrorMessage = @"
   if (self.delegate && [self.delegate respondsToSelector:@selector(webView:shouldStartLoadWithRequest:navigationType:)])
   {
     return [self.delegate webView:webView
-shouldStartLoadWithRequest:request
-            navigationType:navigationType];
+       shouldStartLoadWithRequest:request
+                   navigationType:navigationType];
   }
   return YES;
 }
@@ -153,8 +171,8 @@ shouldStartLoadWithRequest:request
   {
     // exception
     NSError *noSchemaError = [NSError errorWithDomain:kJSInterfaceWebViewWrapperErrorDomain
-                                                  code:kJSInterfaceWebViewWrapperNoSchemaErrorCode
-                                              userInfo:@{NSLocalizedDescriptionKey : kJSInterfaceWebViewWrapperNoSchemaErrorMessage}];
+                                                 code:kJSInterfaceWebViewWrapperNoSchemaErrorCode
+                                             userInfo:@{NSLocalizedDescriptionKey : kJSInterfaceWebViewWrapperNoSchemaErrorMessage}];
     [self __raiseException:noSchemaError];
   }
   else
@@ -168,8 +186,8 @@ shouldStartLoadWithRequest:request
   {
     // exception
     NSError *noSelectorsError = [NSError errorWithDomain:kJSInterfaceWebViewWrapperErrorDomain
-                                                 code:kJSInterfaceWebViewWrapperNullSelectorsErrorCode
-                                             userInfo:@{NSLocalizedDescriptionKey : kJSInterfaceWebViewWrapperNullSelectorsErrorMessage}];
+                                                    code:kJSInterfaceWebViewWrapperNullSelectorsErrorCode
+                                                userInfo:@{NSLocalizedDescriptionKey : kJSInterfaceWebViewWrapperNullSelectorsErrorMessage}];
     [self __raiseException:noSelectorsError];
   }
   
@@ -294,7 +312,7 @@ shouldStartLoadWithRequest:request
       // Creating the function implementation
       [thisSelectorParams enumerateObjectsUsingBlock:^(NSString *param, NSUInteger idx, BOOL *stop) {
         if (idx == 0)
-          [functionsString appendFormat:@" document.location = \"%@://%@?", receivedCustomSchema, obj];
+          [functionsString appendFormat:@" setTimeout(function(){document.location = \"%@://%@?", receivedCustomSchema, obj];
         
         if (idx > 0)
           // Separating params
@@ -304,7 +322,7 @@ shouldStartLoadWithRequest:request
         
         if (idx == thisSelectorParams.count - 1)
           // Closing function
-          [functionsString appendString:@"\";}"];
+          [functionsString appendString:[NSString stringWithFormat:@"\";},%@)}", @(idx*kJSInterfaceWebViewWrapperSelectorDelayInMilliseconds)]];
       }];
       
       if (idx < selectors.count)
@@ -313,7 +331,9 @@ shouldStartLoadWithRequest:request
     }
     else
     {
-      [functionsString appendFormat:@"%@ : function() { document.location = \"%@://%@\"; }",obj,receivedCustomSchema,obj];
+      // Inserito un timeout di 500 ms per evitare che i location si accavallino e venga considerato
+      // solo l'ultimo ricevuto
+      [functionsString appendFormat:@"%@ : function() { setTimeout(function (){ document.location = \"%@://%@\"; },%@); }",obj,receivedCustomSchema,obj, @(idx*kJSInterfaceWebViewWrapperSelectorDelayInMilliseconds)];
       if (idx < selectors.count - 1)
         [functionsString appendString:@","];
     }
@@ -325,7 +345,7 @@ shouldStartLoadWithRequest:request
 - (NSString *)__getActionFromURLAbsoluteString:(NSString *)absoluteStr
 {
   // Splitting the string
-  NSString *hierarchicalUrlPart = [absoluteStr componentsSeparatedByString:@"://"].lastObject;
+  NSString *hierarchicalUrlPart = [absoluteStr componentsSeparatedByString:[NSString stringWithFormat:@"%@://", receivedCustomSchema]].lastObject;
   if (hierarchicalUrlPart)
   {
     return [hierarchicalUrlPart componentsSeparatedByString:@"?"].firstObject;
@@ -336,36 +356,40 @@ shouldStartLoadWithRequest:request
 - (NSDictionary *)__valuesForParams:(NSArray *)params inURLString:(NSString *)urlStr
 {
   // Splitting the string
-  NSString *hierarchicalUrlPart = [urlStr componentsSeparatedByString:@"://"].lastObject;
+  NSString *hierarchicalUrlPart = [urlStr componentsSeparatedByString:[NSString stringWithFormat:@"%@://", receivedCustomSchema]].lastObject;
   if (hierarchicalUrlPart)
   {
-    return [self __handleQueryString:[hierarchicalUrlPart componentsSeparatedByString:@"?"].lastObject];
+    NSMutableString *queryStr = [NSMutableString new];
+    NSArray<NSString *> *parts = [hierarchicalUrlPart componentsSeparatedByString:@"?"];
+    // Re-creating the correct queryString
+    [parts enumerateObjectsUsingBlock:^(NSString * _Nonnull obj, NSUInteger idx, BOOL * _Nonnull stop) {
+      if (idx > 0)
+      {
+        [queryStr appendString:obj];
+        if (idx < parts.count-1)
+          [queryStr appendString:@"?"];
+      }
+    }];
+    return [self __handleQueryString:queryStr
+                          withParams:params];
   }
   return nil;
 }
 
-- (NSDictionary *)__handleQueryString:(NSString *)queryStr
+- (NSDictionary *)__handleQueryString:(NSString *)queryStr withParams:(NSArray *)params
 {
   // queryStr = @"var1=val1&var2=val2";
   if (queryStr && [queryStr length] > 0)
   {
     NSMutableDictionary *queryDict = [NSMutableDictionary new];
-    NSArray *singleQuery = [queryStr componentsSeparatedByString:@"&"];
-    // singleQuery = @[@"var1=val1", @"var2=val2"];
-    for (NSString *keyValue in singleQuery)
-    {
-      NSArray *thisQuery = [keyValue componentsSeparatedByString:@"="];
-      // thisQuery = @[@"var1", @"val1"];
-      NSString *key = thisQuery.firstObject;  // @"var1"
-      NSString *value = thisQuery.lastObject; // @"val1"
-      value = [value stringByReplacingPercentEscapesUsingEncoding: NSUTF8StringEncoding];
-      if (key)
-      {
-        [queryDict setObject:(value) ? value : @""
-                      forKey:key];
-        // queryDict = @{@"var1": @"val1", @"var2": @"val2"};
-      }
-    }
+    // Populating the mutable dictionary only with the values for the params specified
+    [params enumerateObjectsUsingBlock:^(NSString *obj, NSUInteger idx, BOOL * _Nonnull stop) {
+      NSString *value = [queryStr componentsSeparatedByString:params[idx]].lastObject;
+      value = [value substringFromIndex:1];
+      
+      [queryDict setObject:(value) ? value : @""
+                    forKey:params[idx]];
+    }];
     return queryDict;
   }
   return nil;
